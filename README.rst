@@ -38,3 +38,34 @@ performance analysis based dynamic information
    put 24.out, 36.out ... as input with x axis 24, 36 ... 
    and predict x=120, 240 write out to file +120.out and +240.out. 
    the '+' flag is used to switch mode
+=======
+*  drawline.py : used to draw lines from value profiling
+*  dirdiff.sh  : compare two dir's llvmprof.out file and report whether they are
+   same
+
+unit test
+---------
+
+we provide some unit test in ``unit`` dir. to compile them, you need `google
+test`_ and `google mock`_
+
+.. _google test: https://code.google.com/p/googletest
+.. _google mock: https://code.google.com/p/googlemock
+
+.. code:: bash
+
+   $ cmake .. -DUNIT_TEST=On
+   $ make
+   $ cd unit
+   $ ./unit_test
+
+documents
+----------
+
+we provide documents on wiki pages, you can use git submodule to sync them into
+doc folder.
+
+.. code:: bash
+
+   $ git submodule init
+   $ git submodule update

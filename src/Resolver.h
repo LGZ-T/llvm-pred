@@ -9,6 +9,7 @@
 
 #include <llvm/Pass.h>
 #include <llvm/IR/Instruction.h>
+#include <llvm/Analysis/CallGraph.h>
 #include <llvm/Analysis/MemoryDependenceAnalysis.h>
 
 #include <ProfileInfo.h>
@@ -33,6 +34,13 @@ namespace lle{
          >
       ResolveResult;
 	typedef std::pair<llvm::MemDepResult,llvm::BasicBlock*> FindedDependenciesType;
+
+   class DataDepGraph;
+   class ResolveEngine;
+   struct InitRule;
+   struct MDARule;
+   struct GEPFilter;
+   struct CGFilter;
 };
 
 /**
@@ -50,7 +58,6 @@ struct lle::UseOnlyResolve
 {
    llvm::Use* operator()(llvm::Value*, lle::ResolverBase*);
 };
-
 
 /**
  * solve some special global variable situation
@@ -139,6 +146,8 @@ class lle::ResolverBase
    // and return true
    bool resolve_if(llvm::Value* V, std::function<bool(llvm::Value*)> lambda);
 
+   llvm::Value* find_store(llvm::Use& V);
+
 };
 
 template<typename Impl = lle::NoResolve>
@@ -206,9 +215,134 @@ class lle::ResolverPass: public llvm::FunctionPass
    }
    void getAnalysisUsage(llvm::AnalysisUsage& AU) const;
    bool runOnFunction(llvm::Function& F) {return false;}
+};
+// a redesigned new resolve engine. 
+// support Use* 
+// support CallBack
+class lle::ResolveEngine
+{
+   public:
+   // if return true, means found a solve.
+   typedef std::function<bool(llvm::Use*, DataDepGraph&)> SolveRule;
+   // if return true, stop solve in current branch
+   typedef std::function<bool(llvm::Use*)> CallBack;
 
+   private:
+   bool (*implicity_rule)(llvm::Value*, DataDepGraph& G);
+   std::vector<SolveRule> rules;
+   std::vector<CallBack> filters;
+   size_t max_iteration, iteration;
+   void do_solve(DataDepGraph& G, CallBack& C);
+
+   public:
+   ResolveEngine();
+   // add a rule in engine
+   void addRule(SolveRule rule){
+      rules.push_back(rule);
+   }
+   template<typename R>
+   typename std::result_of<R(ResolveEngine&)>::type
+   addRule(R rule){
+      rule(*this);
+   }
+
+   // add filter in engine, filter is a helper callback, which used to cut
+   // search path.
+   void addFilter(CallBack filter){
+      filters.push_back(filter);
+   }
+
+   void setMaxIteration(size_t max) { max_iteration = max;}
+   DataDepGraph resolve(llvm::Value* I, CallBack C = always_false);
+   DataDepGraph resolve(llvm::Use& U, CallBack C = always_false);
+
+   static const CallBack always_false;
+   // { normal version: these used for lookup it use who
+   // a public rule used for solve ssa dependency
+   static void base_rule(ResolveEngine&);
+   // a public rule used for solve simple load.
+   static const SolveRule useonly_rule;
+   // a public rule used for expose gep instruction
+   static const SolveRule gep_rule;
+   static const SolveRule global_rule;
+   // }
+   // { reversed version: these used for lookup who use it.
+   // a public rule used for lookup it's user's uses
+   static void ibase_rule(ResolveEngine&);
+   // use with InitRule, a public rule used for 
+   static const SolveRule iuse_rule;
+   // }
+   // return storeinst if found
+   llvm::Value* find_store(llvm::Use&, CallBack C = always_false);
+   // return loadinst or callinst
+   llvm::Value* find_visit(llvm::Use&, CallBack C = always_false);
+   llvm::Value* find_visit(llvm::Value*, CallBack C = always_false);
 };
 
+
+/** make a rule only run once **/
+struct lle::InitRule
+{
+   bool initialized;
+   ResolveEngine::SolveRule rule;
+   InitRule(const ResolveEngine::SolveRule r):initialized(false),rule(r) {}
+   bool operator()(llvm::Use*, DataDepGraph& G);
+   // clear state by hand after one resolve
+   void clear(){ initialized = false;}
+};
+
+struct lle::MDARule
+{
+   llvm::MemoryDependenceAnalysis& MDA;
+   llvm::AliasAnalysis& AA;
+   MDARule(llvm::MemoryDependenceAnalysis& MD, 
+         llvm::AliasAnalysis& A):
+      MDA(MD),AA(A) {}
+   void operator()(llvm::Use*, DataDepGraph& G);
+};
+
+/** gep filter can limit gep search path, need use with gep_rule.
+ * if we found a gep, and it equals filter, then we continue search, else we
+ * can ignore this branch. 
+ */
+struct lle::GEPFilter
+{
+   std::vector<uint64_t> idxs;
+   // it would only store front constants to idxs.
+   // @example getelementptr @gv, 0, 1, %2
+   // idxs == {0,1}
+   GEPFilter(llvm::GetElementPtrInst*);
+   GEPFilter(llvm::ArrayRef<uint64_t> idx):
+      idxs(idx.begin(), idx.end()) {}
+   GEPFilter(std::initializer_list<uint64_t> idx): idxs(idx) {}
+   // it would only compare front idxs 
+   // @example idxs == {0,1}
+   // getelementptr @gv, 0, 1, 2 ==> true
+   // getelementptr @gv, 0, 2    ==> false
+   // getelementptr @gv, 0       ==> false
+   bool operator()(llvm::Use*);
+};
+
+struct lle::CGFilter
+{
+   struct Record {
+      unsigned first, last; // range [first, last)
+      llvm::CallGraphNode* second;
+   };
+   llvm::DenseMap<llvm::Function*, Record> order_map;
+   std::set<llvm::Value*> Only; // ignore repeat call
+   unsigned threshold;
+   llvm::Instruction* threshold_inst;
+   llvm::Function* threshold_f;
+   llvm::CallGraphNode* root;
+   CGFilter(llvm::CallGraphNode* main, llvm::Instruction* threshold=nullptr);
+   unsigned indexof(llvm::Instruction*);
+   void update(llvm::Instruction* threshold);
+   bool count(llvm::Function* F) {
+      return order_map.count(F);
+   }
+   bool operator()(llvm::Use*);
+};
 
 
 #endif

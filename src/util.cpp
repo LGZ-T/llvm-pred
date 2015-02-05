@@ -1,12 +1,15 @@
 #include "preheader.h"
 
+#include <llvm/IR/CFG.h>
 #include <llvm/ADT/Twine.h>
+#include <llvm/IR/Module.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/InstrTypes.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/ADT/SmallVector.h>
 #include <llvm/IR/GlobalVariable.h>
+#include <llvm/ADT/DepthFirstIterator.h>
 
 #include <set>
 #include <string>
@@ -18,7 +21,7 @@ using namespace std;
 using namespace lle;
 using namespace llvm;
 
-
+#include <iostream>
 //phinode circle recursion visit magic word
 #define LEFT_BRACKET "{"
 #define RIGHT_BRACKET "}"
@@ -125,8 +128,13 @@ static void pretty_print(CmpInst* cmp,raw_ostream& o)
 
 static void pretty_print(Constant* c,raw_ostream& o)
 {
-	if(auto CI = dyn_cast<ConstantInt>(c))
-		CI->getValue().print(o, true);
+	if(auto CI = dyn_cast<ConstantInt>(c)){
+      int64_t a = CI->getSExtValue();
+      if(a < 0)
+		   o<<'('<<a<<')';
+      else
+         o<<a;
+   }
 	else if(auto CFP = dyn_cast<ConstantFP>(c))
 		o<< CFP->getValueAPF().convertToDouble();
 	else if(isa<GlobalValue>(c))
@@ -173,16 +181,20 @@ static void pretty_print(PHINode* PH,raw_ostream& o)
 
 static void pretty_print(LoadInst* LI, raw_ostream& O, bool E)
 {
-   O<<"*";
    if(E) lle::pretty_print(LI->getOperand(0),O);
    else{
-      string S;
-      raw_string_ostream SS(S);
-      LI->getOperand(0)->print(SS);
-      int beg = SS.str().find_first_not_of(" ");
-      int end = SS.str().find(" =");
-      S = SS.str().substr(beg,end-beg);
-      O<<S;
+      if(auto CE = dyn_cast<ConstantExpr>(LI->getPointerOperand())){
+         pretty_print(CE->getAsInstruction(), O, E);
+      }else{
+         O<<"*";
+         string S;
+         raw_string_ostream SS(S);
+         LI->getOperand(0)->print(SS);
+         int beg = SS.str().find_first_not_of(" ");
+         int end = SS.str().find(" =");
+         S = SS.str().substr(beg,end-beg);
+         O<<S;
+      }
    }
 }
 
@@ -215,10 +227,11 @@ void lle::pretty_print(Value* v,raw_ostream& o, bool expand)
 		PUSH_BRACKETS(14);
 		o<<"(";
 		lle::pretty_print(inst->getOperand(0),o);
-		o<<")?";
+		o<<")?(";
 		lle::pretty_print(inst->getOperand(1),o);
-		o<<":";
+		o<<"):(";
 		lle::pretty_print(inst->getOperand(2),o);
+      o<<")";
 		POP_BRACKETS(14);
 	}
 	else if(auto CI = dyn_cast<CastInst>(inst)){
@@ -293,7 +306,7 @@ bool lle::isArgumentWrite(llvm::Argument *Arg)
          return true;
       }
    }else{
-      for(auto U = user_begin(Arg), E = user_end(Arg); U!=E; ++U){
+      for(auto U = Arg->user_begin(), E = Arg->user_end(); U!=E; ++U){
          if(isa<StoreInst>(*U)) return true;
       }
    }
@@ -315,4 +328,85 @@ bool lle::isArray(Value *V)
    if(F->getName() == "malloc" || F->getName() == "calloc") return true;
    return false;
 
+}
+
+bool lle::isRefGlobal(Value* V, GlobalVariable** pGV, GetElementPtrInst** pGEP)
+{
+   GetElementPtrInst* gep = NULL;
+   while(!isa<GlobalVariable>(V)){
+      if(auto LI = dyn_cast<LoadInst>(V)) V = LI->getPointerOperand();
+      else if(auto Cast = dyn_cast<CastInst>(V)) V = Cast->getOperand(0);
+      else if(auto CE = dyn_cast<ConstantExpr>(V)) V = CE->getAsInstruction();
+      else if(auto GEP = dyn_cast<GetElementPtrInst>(V)){
+         V = GEP->getPointerOperand();
+         gep = GEP;
+      }
+      else return false;
+   }
+   if(pGV) *pGV = cast<GlobalVariable>(V);
+   if(pGEP) *pGEP = gep;
+   return true;
+}
+
+bool std::less<BasicBlock>::operator()(BasicBlock* L, BasicBlock* R)
+{
+   using std::placeholders::_1;
+   if(L->getParent() != R->getParent()) return false;
+   Function* F = L->getParent();
+   unsigned L_idx = std::distance(F->begin(), Function::iterator(L));
+   unsigned R_idx = std::distance(F->begin(), Function::iterator(R));
+   return L_idx < R_idx;
+}
+
+bool std::less<Instruction>::operator()(Instruction* L, Instruction* R)
+{
+   if(L->getParent() != R->getParent())
+      return std::less<BasicBlock>()(L->getParent(), R->getParent());
+   BasicBlock* B = L->getParent();
+   unsigned L_idx = std::distance(B->begin(), BasicBlock::iterator(L));
+   unsigned R_idx = std::distance(B->begin(), BasicBlock::iterator(R));
+   return L_idx < R_idx;
+}
+
+Constant* lle::insertConstantString(Module* M, const string Inserted) 
+{
+   LLVMContext& C = M->getContext();
+   Type* ATy = ArrayType::get(Type::getInt8Ty(C), Inserted.size()+1);
+   Constant* initial = ConstantDataArray::getString(C, Inserted);
+   GlobalVariable* str = new GlobalVariable(*M, ATy, true, GlobalValue::PrivateLinkage, initial);
+
+   Constant* Constant_0 = ConstantInt::get(Type::getInt32Ty(C), 0);
+   Constant* Indicies[] = {Constant_0, Constant_0};
+   return ConstantExpr::getGetElementPtr(str, Indicies);
+}
+
+std::vector<BasicBlock*> lle::getPath(BasicBlock *From, BasicBlock *To)
+{
+   std::vector<BasicBlock*> Path;
+   for(auto I = df_begin(From), E = df_end(From); I!=E; ++I){
+      if(*I == To){
+         unsigned N = I.getPathLength();
+         Path.resize(N);
+         for(unsigned i=0;i<N;++i)
+            Path[i] = I.getPath(i);
+      }
+   }
+   return Path;
+}
+
+GetElementPtrInst* lle::isRefGEP(Use &O)
+{
+   ConstantExpr* CExpr = dyn_cast<ConstantExpr>(O.get());
+   return dyn_cast<GetElementPtrInst>(CExpr?CExpr->getAsInstruction():O.get());
+}
+
+GetElementPtrInst* lle::isRefGEP(Instruction* I)
+{
+   GetElementPtrInst* GEPI = dyn_cast<GetElementPtrInst>(I);
+   if(GEPI) return GEPI;
+   for(auto O = I->op_begin(), E = I->op_end(); O!=E; ++O){
+      GetElementPtrInst* GEPI = isRefGEP(*O);
+      if(GEPI) return GEPI;
+   }
+   return NULL;
 }

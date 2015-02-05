@@ -16,6 +16,7 @@
 #include "util.h"
 #include "config.h"
 #include "LoopTripCount.h"
+#include "Resolver.h"
 #include "debug.h"
 
 using namespace std;
@@ -25,8 +26,6 @@ using namespace llvm;
 char LoopTripCount::ID = 0;
 
 static RegisterPass<LoopTripCount> X("Loop-Trip-Count","Generate and insert loop trip count pass", false, false);
-
-// STATISTIC(NumUnfoundCycle, "Number of unfound loop cycle");
 
 //find start value fron induction variable
 static Value* tryFindStart(PHINode* IND,Loop* L,BasicBlock*& StartBB)
@@ -54,8 +53,16 @@ void LoopTripCount::getAnalysisUsage(llvm::AnalysisUsage & AU) const
 	AU.addRequired<LoopInfo>();
 }
 
-Value* LoopTripCount::insertTripCount(Loop* L, Instruction* InsertPos)
+LoopTripCount::AnalysisedLoop LoopTripCount::analysis(Loop* L)
 {
+	Value* start = NULL;
+	Value* ind = NULL;
+	Value* end = NULL;
+	ConstantInt* step = NULL,*PrevStep = NULL;/*only used if next is phi node*/
+   ResolveEngine RE;
+   RE.addRule(RE.base_rule);
+   RE.addRule(RE.useonly_rule);
+
 	// inspired from Loop::getCanonicalInductionVariable
 	BasicBlock *H = L->getHeader();
 	BasicBlock* LoopPred = L->getLoopPredecessor();
@@ -63,10 +70,7 @@ Value* LoopTripCount::insertTripCount(Loop* L, Instruction* InsertPos)
 	int OneStep = 0;// the extra add or plus step for calc
 
    AssertThrow(LoopPred, not_found("Require Loop has a Pred"));
-	DEBUG(errs()<<"loop  depth:"<<L->getLoopDepth()<<"\n");
 	/** whats difference on use of predecessor and preheader??*/
-	//RET_ON_FAIL(self->getLoopLatch()&&self->getLoopPreheader());
-	//assert(self->getLoopLatch() && self->getLoopPreheader() && "need loop simplify form" );
 	AssertThrow(L->getLoopLatch(), not_found("need loop simplify form"));
 
 	BasicBlock* TE = NULL;//True Exit
@@ -92,7 +96,6 @@ Value* LoopTripCount::insertTripCount(Loop* L, Instruction* InsertPos)
 	AssertThrow(TE, not_found("need have a true exit"));
 
 	Instruction* IndOrNext = NULL;
-	Value* END = NULL;
    //终止块的终止指令：分情况讨论branchinst,switchinst;
    //跳转指令br bool a1,a2;condition<-->bool
 	if(isa<BranchInst>(TE->getTerminator())){
@@ -100,7 +103,8 @@ Value* LoopTripCount::insertTripCount(Loop* L, Instruction* InsertPos)
 		AssertThrow(EBR->isConditional(), not_found("end branch is not conditional"));
 		ICmpInst* EC = dyn_cast<ICmpInst>(EBR->getCondition());
 		if(EC->getPredicate() == EC->ICMP_SGT){
-         AssertThrow(!L->contains(EBR->getSuccessor(0)), not_found(dbg()<<"abnormal exit with great than:"<<*EBR));//终止块的终止指令---->跳出执行循环外的指令
+         AssertThrow(!L->contains(EBR->getSuccessor(0)), not_found(dbg()<<"abnormal exit with great than:"<<*EBR));
+         //终止块的终止指令---->跳出执行循环外的指令
          OneStep += 1;
       } else if(EC->getPredicate() == EC->ICMP_EQ) {
          AssertThrow(!L->contains(EBR->getSuccessor(0)), not_found(dbg()<<"abnormal exit with great than:"<<*EBR));
@@ -110,26 +114,22 @@ Value* LoopTripCount::insertTripCount(Loop* L, Instruction* InsertPos)
          AssertThrow(0, not_found(dbg()<<"unknow combination of end condition:"<<*EC));
       }
 		IndOrNext = dyn_cast<Instruction>(castoff(EC->getOperand(0)));//去掉类型转化
-		END = EC->getOperand(1);
-		DEBUG(errs()<<"end   value:"<<*EC<<"\n");
+		end = EC->getOperand(1);
 	}else if(isa<SwitchInst>(TE->getTerminator())){
 		SwitchInst* ESW = const_cast<SwitchInst*>(cast<SwitchInst>(TE->getTerminator()));
 		IndOrNext = dyn_cast<Instruction>(castoff(ESW->getCondition()));
 		for(auto I = ESW->case_begin(),E = ESW->case_end();I!=E;++I){
 			if(!L->contains(I.getCaseSuccessor())){
-				AssertThrow(!END, not_found("shouldn't have two ends"));
-				END = I.getCaseValue();
+				AssertThrow(!end, not_found("shouldn't have two ends"));
+				end = I.getCaseValue();
 			}
 		}
-		DEBUG(errs()<<"end   value:"<<*ESW<<"\n");
 	}else{
 		AssertThrow(0 ,not_found("unknow terminator type"));
 	}
 
-	AssertThrow(L->isLoopInvariant(END), not_found("end value should be loop invariant"));//至此得END值
+	AssertThrow(L->isLoopInvariant(end), not_found("end value should be loop invariant"));//至此得END值
 
-	Value* start = NULL;
-	Value* ind = NULL;
 	Instruction* next = NULL;
 	bool addfirst = false;//add before icmp ed
 
@@ -137,29 +137,34 @@ Value* LoopTripCount::insertTripCount(Loop* L, Instruction* InsertPos)
 	if(isa<LoadInst>(IndOrNext)){
 		//memory depend analysis
 		Value* PSi = IndOrNext->getOperand(0);//point type Step.i
-
 		int SICount[2] = {0};//store in predecessor count,store in loop body count
-		for( auto I = user_begin(PSi),E = user_end(PSi);I!=E;++I){
-			DISABLE(errs()<<**I<<"\n");
-			StoreInst* SI = dyn_cast<StoreInst>(*I);
-			if(!SI || SI->getOperand(1) != PSi) continue;
-			if(!start&&L->isLoopInvariant(SI->getOperand(0))) {
-				if(SI->getParent() != LoopPred)
-					if(std::find(pred_begin(LoopPred),pred_end(LoopPred),SI->getParent()) == pred_end(LoopPred)) continue;
-				start = SI->getOperand(0);
-				startBB = SI->getParent();
-				++SICount[0];
-			}
-			Instruction* SI0 = dyn_cast<Instruction>(SI->getOperand(0));
-			if(L->contains(SI) && SI0 && SI0->getOpcode() == Instruction::Add){
-				next = SI0;
-				++SICount[1];
-			}
 
+      Value* Store = RE.find_store(IndOrNext->getOperandUse(0));
+      if(Store && isa<StoreInst>(Store)){
+         StoreInst* SI = cast<StoreInst>(Store);
+         if(L->isLoopInvariant(SI->getValueOperand())){
+            start = SI->getValueOperand();
+            startBB = SI->getParent();
+            // we always found the nearest storeinst
+            SICount[0] = 1;
+         }
+      }
+
+		for(auto I = PSi->user_begin(),E = PSi->user_end();I!=E;++I){
+			StoreInst* SI = dyn_cast<StoreInst>(*I);
+			if(SI==NULL || SI->getOperand(1) != PSi) continue;
+         if(L->contains(SI)){
+            Instruction* SI0 = dyn_cast<Instruction>(SI->getValueOperand());
+            if(SI0 && SI0->getOpcode() == Instruction::Add){
+               next = SI0;
+               ++SICount[1];
+            }
+         }
 		}
+
       AssertThrow(SICount[0]==1 && SICount[1]==1, 
             not_found(dbg() <<"should only have 1 store in/before loop:"
-               <<SICount[0] <<"," <<SICount[1] <<*PSi));
+               <<SICount[1] <<"," <<SICount[0]<<*PSi));
 		ind = IndOrNext;
 	}else{
 		if(isa<PHINode>(IndOrNext)){
@@ -178,122 +183,116 @@ Value* LoopTripCount::insertTripCount(Loop* L, Instruction* InsertPos)
 		for(auto I = H->begin();isa<PHINode>(I);++I){
 			PHINode* P = cast<PHINode>(I);
 			if(ind && P == ind){
-				//start = P->getIncomingValueForBlock(L->getLoopPredecessor());
 				start = tryFindStart(P, L, startBB);
 				next = dyn_cast<Instruction>(P->getIncomingValueForBlock(L->getLoopLatch()));
 			}else if(next && P->getIncomingValueForBlock(L->getLoopLatch()) == next){
-				//start = P->getIncomingValueForBlock(L->getLoopPredecessor());
 				start = tryFindStart(P, L, startBB);
 				ind = P;
 			}
 		}
 	}
 
-
 	AssertThrow(start , not_found("couldn't find a start value"));
-	//process complex loops later
-	//DEBUG(if(L->getLoopDepth()>1 || !L->getSubLoops().empty()) return NULL);
-	DEBUG(errs()<<"start value:"<<*start<<"\n");
-	DEBUG(errs()<<"ind   value:"<<*ind<<"\n");
-	DEBUG(errs()<<"next  value:"<<*next<<"\n");
-
 
 	//process non add later
 	unsigned next_phi_idx = 0;
-	ConstantInt* Step = NULL,*PrevStep = NULL;/*only used if next is phi node*/
    AssertThrow(next, not_found("Next not found"));
 	PHINode* next_phi = dyn_cast<PHINode>(next);
 	do{
 		if(next_phi) {
 			next = dyn_cast<Instruction>(next_phi->getIncomingValue(next_phi_idx));
 			AssertThrow(next, not_found("Next not found"));
-			DEBUG(errs()<<"next phi "<<next_phi_idx<<":"<<*next<<"\n");
-			if(Step&&PrevStep){
-				Assert(Step->getSExtValue() == PrevStep->getSExtValue(),"");
+			if(step&&PrevStep){
+				Assert(step->getSExtValue() == PrevStep->getSExtValue(),"");
 			}
-			PrevStep = Step;
+			PrevStep = step;
 		}
 		Assert(next->getOpcode() == Instruction::Add , "why induction increment is not Add");
 		Assert(next->getOperand(0) == ind ,"why induction increment is not add it self");
-		Step = dyn_cast<ConstantInt>(next->getOperand(1));
-		Assert(Step,"");
+		step = dyn_cast<ConstantInt>(next->getOperand(1));
+		Assert(step,"");
 	}while(next_phi && ++next_phi_idx<next_phi->getNumIncomingValues());
-	//RET_ON_FAIL(Step->equalsInt(1));
-	//assert(VERBOSE(Step->equalsInt(1),Step) && "why induction increment number is not 1");
 
-
+	if(addfirst) OneStep -= 1;
+	if(step->isMinusOne()) OneStep*=-1;
+	assert(OneStep<=1 && OneStep>=-1);
+   return AnalysisedLoop{OneStep, start,step,end,ind};
+}
+Value* LoopTripCount::insertTripCount(AnalysisedLoop AL, StringRef HeaderName, Instruction* InsertPos)
+{
 	Value* RES = NULL;
+   Value* start = AL.Start, *END = AL.End;
+   if(!start || !END || !InsertPos || !AL.Step) return NULL;
+   ConstantInt* Step = dyn_cast<ConstantInt>(AL.Step);
+   int OneStep = AL.AdjustStep;
 	//if there are no predecessor, we can insert code into start value basicblock
 	IRBuilder<> Builder(InsertPos);
+   Type* I32Ty = Builder.getInt32Ty();
 	Assert(start->getType()->isIntegerTy() && END->getType()->isIntegerTy() , " why increment is not integer type");
-	if(start->getType() != END->getType()){
-		start = Builder.CreateCast(CastInst::getCastOpcode(start, false,
-					END->getType(), false),start,END->getType());
-	}
-   if(Step->getType() != END->getType()){
-      //Because Step is a Constant, so it casted is constant
-		Step = dyn_cast<ConstantInt>(Builder.CreateCast(CastInst::getCastOpcode(Step, false,
-					END->getType(), false),Step,END->getType()));
-      AssertRuntime(Step, "");
-   }
+
+#define AdjustType(v) ((v->getType() != I32Ty)?\
+         Builder.CreateCast(CastInst::getCastOpcode(v, false, I32Ty, false), v, I32Ty):\
+         v)
+   // adjust type to int 32
+   start = AdjustType(start);
+   END = AdjustType(END);
+   Step = dyn_cast<ConstantInt>(AdjustType(Step));
+   AssertRuntime(Step, "");
+#undef AdjustType
+
 	if(Step->isMinusOne())
 		RES = Builder.CreateSub(start,END);
 	else//Step Couldn't be zero
 		RES = Builder.CreateSub(END, start);
-	if(addfirst) OneStep -= 1;
-	if(Step->isMinusOne()) OneStep*=-1;
-	assert(OneStep<=1 && OneStep>=-1);
 	RES = (OneStep==1)?Builder.CreateAdd(RES,Step):(OneStep==-1)?Builder.CreateSub(RES, Step):RES;
 	if(!Step->isMinusOne()&&!Step->isOne())
 		RES = Builder.CreateSDiv(RES, Step);
-	RES->setName(H->getName()+".tc");
+	RES->setName(HeaderName+".tc");
 
 	return RES;
 }
 
 bool LoopTripCount::runOnFunction(Function &F)
 {
-   LoopInfo& LI = getAnalysis<LoopInfo>();
+   LI = &getAnalysis<LoopInfo>();
    LoopMap.clear();
    CycleMap.clear();
+   unfound_str = "";
 
-   unfound<<"Function:"<<F.getName()<<"\n";
-
-   for(Loop* TopL : LI){
+   for(Loop* TopL : *LI){
       for(auto LIte = df_begin(TopL), E = df_end(TopL); LIte!=E; ++LIte){
          Loop* L = *LIte;
-         Value* CC = NULL;
+         Value* TC = NULL;
+         AnalysisedLoop AL = {0};
          try{
-             CC = getOrInsertTripCount(L);
+            AL = analysis(L);
+            /**trying to find inserted loop trip count in preheader */
+            BasicBlock* Preheader = L->getLoopPreheader();
+            if(Preheader){
+               string HName = (L->getHeader()->getName()+".tc").str();
+               auto Found = find_if(Preheader->begin(),Preheader->end(), [HName](Instruction& I){
+                     return I.getName()==HName;
+                     });
+               if(Found != Preheader->end()) TC = &*Found;
+            }
+            AL.TripCount = TC;
          }catch(NotFound& E){
-            ++NumUnfoundCycle;
             unfound<<"  "<<E.get_line()<<":  "<<E.what()<<"\n";
             unfound<<"\t"<<*L<<"\n";
          }
          LoopMap[L] = CycleMap.size(); // write to cache
-         CycleMap.push_back(CC);
+         CycleMap.push_back(AL);
          AssertRuntime(LoopMap[L] < CycleMap.size() ," should insert indeed");
       }
    }
+   unfound.str();
 
 	return true;
 }
 
-LoopTripCount::~LoopTripCount()
-	//we have no place to print out statistics information
-{
-	if(NumUnfoundCycle){
-		errs()<<std::string(73,'*')<<"\n";
-		errs()<<"\tNote!! there are "<<NumUnfoundCycle<<" loop cycles unresolved:\n";
-		errs()<<unfound.str();
-		errs()<<std::string(73,'*')<<"\n";
-	}
-}
-
 void LoopTripCount::print(llvm::raw_ostream& OS,const llvm::Module*) const
 {
-   LoopInfo& LI = getAnalysis<LoopInfo>();
-   for(Loop* TopL : LI){
+   for(Loop* TopL : *LI){
       for(auto LIte = df_begin(TopL), E = df_end(TopL); LIte != E; ++LIte){
          Loop* L = *LIte;
          Value* TripCount = getTripCount(L);
@@ -302,24 +301,12 @@ void LoopTripCount::print(llvm::raw_ostream& OS,const llvm::Module*) const
          OS<<"Cycle:"<<*TripCount<<"\n";
       }
    }
+   errs()<<unfound_str;
 }
 
-Value* LoopTripCount::getTripCount(Loop *L) const
+Loop* LoopTripCount::getLoopFor(BasicBlock *BB) const
 {
-   auto ite = LoopMap.find(L);
-   if(ite==LoopMap.end()){
-      BasicBlock* Preheader = L->getLoopPreheader();
-      if(Preheader == NULL)
-         return NULL;
-      string HName = (L->getHeader()->getName()+".tc").str();
-      auto Found = find_if(Preheader->begin(),Preheader->end(), [HName](Instruction& I){
-            return I.getName()==HName;
-            });
-      if(Found == Preheader->end())
-         return NULL;
-      return &*Found;
-   }else
-      return CycleMap[ite->second];
+   return LI->getLoopFor(BB);
 }
 
 Value* LoopTripCount::getOrInsertTripCount(Loop *L)
@@ -328,7 +315,14 @@ Value* LoopTripCount::getOrInsertTripCount(Loop *L)
       InsertPreheaderForLoop(L, this);
    }
    Instruction* InsertPos = L->getLoopPredecessor()->getTerminator();
-   return getTripCount(L)?:insertTripCount(L, InsertPos);
+   Value* V = getTripCount(L);
+   if(V==NULL){
+      auto ite = LoopMap.find(L);
+      if(ite == LoopMap.end()) return NULL;
+      AnalysisedLoop& AL = CycleMap[ite->second];
+      AL.TripCount = V = insertTripCount(AL, L->getHeader()->getName(), InsertPos);
+   }
+   return V;
 }
 
 void LoopTripCount::updateCache(LoopInfo& LI)
