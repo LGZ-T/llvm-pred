@@ -8,6 +8,7 @@
 #include <llvm/Support/raw_ostream.h>
 #include <llvm/ADT/DepthFirstIterator.h>
 #include <llvm/ADT/PostOrderIterator.h>
+#include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/Dominators.h>
 
 #include "ddg.h"
@@ -20,6 +21,11 @@ using namespace llvm;
 
 char ResolverPass::ID = 0;
 static RegisterPass<ResolverPass> Y("-Resolver","A Pass used to cache Resolver Result",false,false);
+static const set<string> IgnoreFindCall = {
+   "llvm.lifetime.end",
+   "llvm.lifetime.start",
+   "free"
+};
 
 Use* NoResolve::operator()(Value* V, ResolverBase* _UNUSED_)
 {
@@ -439,6 +445,14 @@ ResolveEngine::ResolveEngine()
 
 void ResolveEngine::do_solve(DataDepGraph& G, CallBack& C)
 {
+   if(G.getRootKey().is<Use*>()){
+      // first time run rule, because some filter would directly refuse
+      // query itself, which make results empty, so we didn't run filter
+      // at first time.
+      Use* un = G.popUnsolved();
+      for(auto r = rules.rbegin(), e = rules.rend(); r!=e; ++r)
+         if((*r)(un, G)) break;
+   }
    while(Use* un = G.popUnsolved()){
       if(++iteration>max_iteration) break;
       bool jump = false;
@@ -451,85 +465,92 @@ void ResolveEngine::do_solve(DataDepGraph& G, CallBack& C)
          G.markIgnore(un); // if refused, this node is ignored.
          continue;
       }
-      for(auto r = rules.rbegin(), e = rules.rend(); r!=e; ++r){
+      for(auto r = rules.rbegin(), e = rules.rend(); r!=e; ++r)
          if((*r)(un, G)) break;
-      }
    }
 }
 
-DataDepGraph ResolveEngine::resolve(Use& U, CallBack C)
-{
-   DataDepGraph G;
-   // if is ::implicity_rule, it is dependency query.
-   G.isDependency(implicity_rule == ::implicity_rule);
-   iteration = 0;
-   G.addUnsolved(U);
-   do_solve(G, C);
-   G.setRoot(&U);
-   return G;
-}
-
-DataDepGraph ResolveEngine::resolve(Value* I, CallBack C)
+DataDepGraph ResolveEngine::resolve(QueryTy Q, CallBack C)
 {
    DataDepGraph G;
    G.isDependency(implicity_rule == ::implicity_rule);
    iteration = 0;
-   implicity_rule(I, G);
+   if(Q.is<Use*>())
+      G.addUnsolved(*Q.get<Use*>());
+   else
+      implicity_rule(Q.get<Value*>(), G);
+   G.setRoot(Q);
    do_solve(G, C);
-   G.setRoot(I);
    return G;
-}
-
-Value* ResolveEngine::find_store(Use& Tg, CallBack C)
-{
-   Value* ret = NULL;
-   resolve(Tg, [&ret, &C](Use* U){
-         User* Ur = U->getUser();
-         if(isa<StoreInst>(Ur))
-            ret=Ur;
-         return C(U);
-      });
-   return ret;
 }
 
 struct find_visit
 {
    llvm::Value*& ret;
-   ResolveEngine::CallBack& C;
-   llvm::User* TgUr;
-   find_visit(llvm::Value*& ret, ResolveEngine::CallBack& C, llvm::User* Ur):
-      ret(ret), C(C), TgUr(Ur) {}
+   find_visit(llvm::Value*& ret):ret(ret) {}
    bool operator()(Use* U){
       User* Ur = U->getUser();
-      bool Pass = C(U);
-      if(Ur != TgUr && !Pass){// only it isn't itSelf and not banned by Caller
-         if(isa<LoadInst>(Ur))
-            ret=Ur;
-         else if(CallInst* CI = dyn_cast<CallInst>(Ur)){//call inst also is a kind of visit
-            if(Function* F = dyn_cast<Function>(castoff(CI->getCalledValue())))
-               if(!F->getName().startswith("llvm.lifetime"))//some llvm call should ignore
-                  ret=CI;
-         }
+      if (isa<LoadInst>(Ur))
+         ret = Ur;
+      else if (CallInst* CI = dyn_cast<CallInst>(Ur)) {
+         // call inst also is a kind of visit
+         StringRef Name = castoff(CI->getCalledValue())->getName();
+         if (auto I = dyn_cast<IntrinsicInst>(CI))
+            Name = getName(I->getIntrinsicID());
+         if (!IgnoreFindCall.count(Name)) // some call should ignore
+            ret = CI;
       }
+
       // most of time, we just care whether it has visitor,
       // so if we found one, we can stop search
-      return ret||Pass;
+      return ret;
    }
 };
 
-Value* ResolveEngine::find_visit(Use& U, CallBack C)
+ResolveEngine::CallBack ResolveEngine::exclude(QueryTy Q)
 {
-   Value* ret = NULL;
-   User* TgUr = U.getUser();
-   resolve(U, ::find_visit(ret, C, TgUr));
-   return ret;
+   User* Tg = (Q.is<Use*>()) ? Q.get<Use*>()->getUser() : dyn_cast<User>(Q.get<Value*>());
+   return [Tg](Use* U){
+      User* Ur = U->getUser();
+      return Tg == Ur;
+   };
 }
 
-Value* ResolveEngine::find_visit(Value* V, CallBack C)
+ResolveEngine::CallBack ResolveEngine::findVisit(Value*& V)
 {
-   Value* ret = NULL;
-   resolve(V, ::find_visit(ret, C, nullptr));
-   return ret;
+   V = NULL;
+   return ::find_visit(V);
+}
+
+Value* ResolveEngine::find_visit(QueryTy Q)
+{
+   addFilter(exclude(Q));
+   Value* V = NULL;
+   resolve(Q, ::find_visit(V));
+   rmFilter(-1);
+   return V;
+}
+
+ResolveEngine::CallBack ResolveEngine::findStore(Value *&V)
+{
+   V = NULL;
+   return [&V](Use* U){
+      User* Ur = U->getUser();
+      if(isa<StoreInst>(Ur)){
+         V=Ur;
+         return true;
+      }
+      return false;
+   };
+}
+
+ResolveEngine::CallBack ResolveEngine::findRef(Value *&V)
+{
+   auto visit = findVisit(V);
+   auto store = findStore(V);
+   return [visit, store](Use* U) {
+      return visit(U)||store(U);
+   };
 }
 
 //===========================RESOLVE RULES======================================//
@@ -577,8 +598,18 @@ static bool use_inverse_rule_(Use* U, DataDepGraph& G)
 {
    Value* V = U->get();
    std::vector<Use*> uses;
-   pushback_to(V->use_begin(), find_iterator(*U), uses);
+   auto bound = find_iterator(*U);
+   pushback_to(V->use_begin(), bound, uses);
    G.addSolved(U, uses.rbegin(), uses.rend());
+   // add all gep before inst, for dont' miss load like:
+   // %0 = getelementptr
+   // query
+   // load %0
+   for_each(bound, V->use_end(), [U, &G](Use& u) {
+      auto GEP = isGEP(u.getUser());
+      if(GEP && GEP->getPointerOperand() == u.get())
+         G.addSolved(U,u);
+   });
    return true;
 }
 static bool implicity_rule(Value* V, DataDepGraph& G)
@@ -610,14 +641,20 @@ static bool gep_rule_(Use* U, DataDepGraph& G)
    Use* Tg = U;
    bool ret = false;
    while( (Tg = Tg->getNext()) ){
-      auto V = Tg->getUser();
-      if(isa<GetElementPtrInst>(V) && V->getOperand(0) == Tg->get() ){
+      auto GEP = isGEP(Tg->getUser());
+      if(GEP && GEP->getPointerOperand() == Tg->get() ){
          // add all GEP to Unsolved
-         G.addSolved(U, V->getOperandUse(0));
+         G.addSolved(U, GEP->getOperandUse(0));
          ret = true;
       }
    }
    return ret;
+}
+static bool icast_rule_(Use* U, DataDepGraph& G)
+{
+   if(auto CI = dyn_cast<CastInst>(U->get()))
+      G.addSolved(U, CI->getOperandUse(0));
+   return false;// always want to find more result
 }
 
 bool InitRule::operator()(Use* U, DataDepGraph& G)
@@ -663,10 +700,10 @@ void ResolveEngine::ibase_rule(ResolveEngine& RE)
    RE.addRule(SolveRule(direct_inverse_rule_));
    RE.implicity_rule = ::implicity_inverse_rule;
 }
-const ResolveEngine::CallBack ResolveEngine::always_false = [](Use* U){ return false; };
 const ResolveEngine::SolveRule ResolveEngine::useonly_rule = useonly_rule_;
 const ResolveEngine::SolveRule ResolveEngine::gep_rule = gep_rule_;
 const ResolveEngine::SolveRule ResolveEngine::iuse_rule = use_inverse_rule_;
+const ResolveEngine::SolveRule ResolveEngine::icast_rule = icast_rule_;
 
 //===============================RESOLVE RULES END===============================//
 //=============================RESOLVE FILTERS BEGIN=============================//
@@ -698,16 +735,6 @@ bool GEPFilter::operator()(llvm::Use* U)
       return !eq;
    }
    return false;
-}
-CallGraphNode* last_valid_child(CallGraphNode* N, set<Value*>& Only)
-{
-   using RIte = std::reverse_iterator<CallGraphNode::iterator>;
-   auto found = find_if(RIte(N->end()), RIte(N->begin()), [&Only](RIte::value_type& P){
-            auto F = P.second->getFunction();
-            return Only.count(P.first) && F != NULL && !F->isDeclaration();
-         });
-   if(found == RIte(N->begin())) return NULL;
-   else return found->second;
 }
 
 /** CGFilter : 利用CallGraph信息, 求解两条指令的偏序关系, 即给出一条指令作为基
@@ -748,6 +775,16 @@ void DebugCGFilter(CGFilter* F)
    }
 }
 #endif
+static CallGraphNode* last_valid_child(CallGraphNode* N, set<Value*>& Only)
+{
+   using RIte = std::reverse_iterator<CallGraphNode::iterator>;
+   auto found = find_if(RIte(N->end()), RIte(N->begin()), [&Only](RIte::value_type& P){
+            auto F = P.second->getFunction();
+            return Only.count(P.first) && F != NULL && !F->isDeclaration();
+         });
+   if(found == RIte(N->begin())) return NULL;
+   else return found->second;
+}
 
 CGFilter::CGFilter(CallGraphNode* root_, Instruction* threshold_inst_): root(root_)
 {
@@ -842,8 +879,16 @@ bool CGFilter::operator()(Use* U)
    if(order == UINT_MAX) return true;
    if(order == threshold){
       AssertRuntime(threshold_f == F, "should be same function "<<order<<":"<<threshold);
-      return !std::less<Instruction>()(threshold_inst, I);
+      return std::less_equal<Instruction>()(I, threshold_inst);
    }
    return order < threshold;
+}
+bool iUseFilter::operator()(Use* U)
+{
+   if (pos == NULL) return false;
+   if (isGEP(U->getUser())) return false;
+   if (auto I = dyn_cast<Instruction>(U->getUser()))
+      if(std::less<Instruction>()(I, pos)) return true;
+   return false;
 }
 //==============================RESOLVE FILTERS END==============================//

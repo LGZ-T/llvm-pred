@@ -9,6 +9,7 @@
 
 #include <llvm/Pass.h>
 #include <llvm/IR/Instruction.h>
+#include <llvm/ADT/PointerUnion.h>
 #include <llvm/Analysis/CallGraph.h>
 #include <llvm/Analysis/MemoryDependenceAnalysis.h>
 
@@ -41,6 +42,7 @@ namespace lle{
    struct MDARule;
    struct GEPFilter;
    struct CGFilter;
+   struct iUseFilter;
 };
 
 /**
@@ -146,8 +148,6 @@ class lle::ResolverBase
    // and return true
    bool resolve_if(llvm::Value* V, std::function<bool(llvm::Value*)> lambda);
 
-   llvm::Value* find_store(llvm::Use& V);
-
 };
 
 template<typename Impl = lle::NoResolve>
@@ -224,6 +224,7 @@ class lle::ResolveEngine
    public:
    // if return true, means found a solve.
    typedef std::function<bool(llvm::Use*, DataDepGraph&)> SolveRule;
+   typedef llvm::PointerUnion<llvm::Value*, llvm::Use*> QueryTy;
    // if return true, stop solve in current branch
    typedef std::function<bool(llvm::Use*)> CallBack;
 
@@ -252,11 +253,16 @@ class lle::ResolveEngine
       filters.push_back(filter);
    }
 
-   void setMaxIteration(size_t max) { max_iteration = max;}
-   DataDepGraph resolve(llvm::Value* I, CallBack C = always_false);
-   DataDepGraph resolve(llvm::Use& U, CallBack C = always_false);
+   void rmFilter(int idx){
+      filters.erase(filters.begin()+idx%filters.size());
+   };
 
-   static const CallBack always_false;
+   void setMaxIteration(size_t max) { max_iteration = max;}
+   DataDepGraph resolve(QueryTy Q, CallBack C = always_false);
+
+   static bool always_false(llvm::Use*) {
+      return false;
+   }
    // { normal version: these used for lookup it use who
    // a public rule used for solve ssa dependency
    static void base_rule(ResolveEngine&);
@@ -271,12 +277,22 @@ class lle::ResolveEngine
    static void ibase_rule(ResolveEngine&);
    // use with InitRule, a public rule used for 
    static const SolveRule iuse_rule;
+   static const SolveRule icast_rule;
    // }
-   // return storeinst if found
-   llvm::Value* find_store(llvm::Use&, CallBack C = always_false);
-   // return loadinst or callinst
-   llvm::Value* find_visit(llvm::Use&, CallBack C = always_false);
-   llvm::Value* find_visit(llvm::Value*, CallBack C = always_false);
+   // {
+   static CallBack exclude(QueryTy);
+   // find a visit(load and call) for Q, this behave like this:
+   // addFilter(exclude(Q))//ignore itself
+   // resolve(Q, if_is_load_then_store_it);
+   // rmFilter(exclude(Q))
+   llvm::Value* find_visit(QueryTy Q);
+   // update V if find a visit inst(load and call)
+   static CallBack findVisit(llvm::Value*& V);
+   // update V if find a store inst
+   static CallBack findStore(llvm::Value*& V);
+   // update V if find a visit or store inst
+   static CallBack findRef(llvm::Value*& V);
+   // }
 };
 
 
@@ -344,5 +360,32 @@ struct lle::CGFilter
    bool operator()(llvm::Use*);
 };
 
+// a inverse use filter is a tool that only let instructions 'after' pass
+// through, it use std::less<Instruction> to implement, so it only can
+// used in function inner. this is used with iuse_rule which import gep
+// 'before'. so this would ignore gep inst. 
+// this is special for such cases like:
+// %0 = getelementptr
+// load %0 <- ban
+// query
+// load %0 <- pass
+struct lle::iUseFilter
+{
+   llvm::Instruction* pos;
+   iUseFilter(ResolveEngine::QueryTy Q){
+      update(Q);
+   }
+   void update(ResolveEngine::QueryTy Q)
+   {
+      using V = llvm::Value*;
+      using U = llvm::Use*;
+      using I = llvm::Instruction;
+      pos = Q.is<V>() ? llvm::dyn_cast<I>(Q.get<V>()) :
+         llvm::dyn_cast<I>(Q.get<U>()->getUser());
+      if (pos->getParent() == NULL) pos = NULL;
+   }
+   bool operator()(llvm::Use*);
+
+};
 
 #endif

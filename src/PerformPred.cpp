@@ -18,28 +18,6 @@ namespace lle {
 
 class lle::PerformPred : public llvm::FunctionPass
 {
-   enum ClassifyType {
-      STATIC_BLOCK,        // 静态预测的普通基本块
-      STATIC_LOOP,         // 静态预测的循环
-      DYNAMIC_LOOP_CONST,  // 动态预测的循环次数常量
-      DYNAMIC_LOOP_INST,   // 动态预测的循环次数非常量
-   };
-   struct Classify {
-      Classify(ClassifyType t, llvm::BasicBlock* b, llvm::BranchProbability p):type(t),block(b) {
-         Assert(t<DYNAMIC_LOOP_CONST, " only accept static prediction type");
-         data.freq = (double)p.getNumerator()/p.getDenominator();
-      }
-      Classify(llvm::BasicBlock* b, int64_t v):type(DYNAMIC_LOOP_CONST),block(b) { data.ext_val = v;}
-      Classify(llvm::BasicBlock* b, llvm::Value* v):type(DYNAMIC_LOOP_INST),block(b) { data.value = v;}
-      ClassifyType type;
-      llvm::BasicBlock* block;
-      union {
-         double freq; // 静态预测会给出频率
-         int64_t ext_val; // 动态预测常量比静态预测更准确
-         llvm::Value* value; // 动态预测变量是一个Value
-      }data;
-   };
-   std::vector<Classify> pred_cls; // 对每个block进行分类, 并且储存关键的属性.
    llvm::DenseMap<llvm::Instruction*, llvm::Value*> Promoted;
    llvm::DenseMap<llvm::Loop*, std::pair<llvm::BasicBlock*, llvm::Value*> > ViewPort; // Header -> (E_P, B_P,N)
    llvm::BranchProbabilityInfo* BPI;
@@ -53,7 +31,6 @@ class lle::PerformPred : public llvm::FunctionPass
    PerformPred():llvm::FunctionPass(ID) {}
    bool runOnFunction(llvm::Function& F) override;
    void getAnalysisUsage(llvm::AnalysisUsage& AU) const override;
-   void print(llvm::raw_ostream&,const llvm::Module*) const override;
 
    private:
    llvm::BasicBlock* promote(llvm::Instruction* LoopTC, llvm::Loop* L);
@@ -101,18 +78,21 @@ static inline int32_t ilog2(uint32_t x) {
 
 static uint32_t GCD(uint32_t A, uint32_t B) // 最大公约数
 {
-   uint32_t Max=A, Min=B;
-   A<B?Max=B,Min=A:0;
+#define swap(A,B) (T=A,A=B,B=T)
+   uint32_t T;
+   A>B?swap(A,B):0;//makes A is small, B is large
+   if(A==0) return 0;
    do{
-      A=Min,B=Max%Min;
-      A<B?Max=B,Min=A:Max=A,Min=B;
-   }while(B!=0);
-   return A;
+      B%=A;
+      A>B?swap(A,B):0;
+   }while(A!=0);
+   return B;
+#undef swap
 }
 static BranchProbability scale(const BranchProbability& prob)
 {
    uint32_t n = prob.getNumerator(), d = prob.getDenominator();
-   uint32_t gcd = GCD(n,d);
+   uint32_t gcd = GCD(n,d)?:1;//if GCD return 0, gcd=1
    return BranchProbability(n/gcd, d/gcd);
 }
 static BranchProbability operator/(const BlockFrequency& LHS, const BlockFrequency& RHS)
@@ -280,6 +260,7 @@ BlockFrequency PerformPred::in_freq(Loop* L)
    return in;
 }
 
+
 bool PerformPred::runOnFunction(Function &F)
 {
    if( F.isDeclaration() ) return false;
@@ -290,108 +271,82 @@ bool PerformPred::runOnFunction(Function &F)
    LTC = &getAnalysis<LoopTripCount>();
    BFI = &getAnalysis<BlockFrequencyInfo>();
    DomT = &getAnalysis<DominatorTreeWrapperPass>().getDomTree();
-   pred_cls.clear();
    LTC->updateCache(*LI);
 
    IRBuilder<> Builder(F.getEntryBlock().getTerminator());
-   Value* SumRhs = NULL;
    BasicBlock* Entry = &F.getEntryBlock();
 
-   Loop* L;
-   Value* TC;
-   std::vector<BasicBlock*> AllBlocks;
-   pushback_to(F.begin(), F.end(), AllBlocks);
-
-   for(auto BB : AllBlocks){
-      L = LI->getLoopFor(BB);
-      TC = L?LTC->getOrInsertTripCount(L):NULL;
-      if(TC!=NULL) continue;
-      // process other blocks outside loops
-      BranchProbability freq = getPathProb(Entry, BB);
-      SumRhs = CreateMul(Builder, one(*BB), freq); //(\[GothicE]-->BB)
-      SumRhs = force_insert(SumRhs, Builder, BB->getName()+".bfreq");
-      if(L && BB == L->getHeader())
-         ViewPort[L] = std::make_pair(Entry, SumRhs);
-      PredBlockProfiler::increaseBlockCounter(BB, SumRhs, Builder.GetInsertPoint());
-      pred_cls.emplace_back(LI->getLoopFor(BB)?STATIC_LOOP:STATIC_BLOCK, BB, freq);
-   }
-
-   for(auto BB : AllBlocks){
-      L = LI->getLoopFor(BB);
-      TC = L?LTC->getOrInsertTripCount(L):NULL;
-      Value* freq;
-      if(TC==NULL) continue;
-
-      if(BB == L->getHeader()){
-         BlockFrequency P = in_freq(L); // in_freq(L) == bfreq(Preheader)
+   for(Loop* TopL : *LI){
+      for (auto LI = df_begin(TopL), LE = df_end(TopL); LI != LE; ++LI) {
+         Loop* L = *LI;
          Loop* PL = L->getParentLoop();
-         BasicBlock* E_V = promote(dyn_cast<Instruction>(TC), L);// view point
-         Builder.SetInsertPoint(E_V->getTerminator());
+         Value* TC = LTC->getOrInsertTripCount(L);
+         BasicBlock* BB = L->getHeader();
+         BlockFrequency P = in_freq(L); // in_freq(L) == bfreq(Preheader)
          Value* B_PN = NULL;
-         if(PL==NULL){// TC(V-->P)
+         // if we can find trip count, we promote view point, or we just select
+         // entry as view point
+         BasicBlock* E_V = TC ? promote(dyn_cast<Instruction>(TC), L) : Entry;
+         Builder.SetInsertPoint(E_V->getTerminator());
+         if (TC == NULL) {
+            // freq(H) / in_freq would get trip count as llvm's freq
+            TC = CreateMul(Builder, one(*BB), BFI->getBlockFreq(BB) / P);
+         } 
+         if (PL == NULL) { // TC (V-->P), if PL is NULL, it is Top Loop
 #if defined(PROMOTE_FREQ_path_prob)
-            B_PN = CreateMul(Builder, TC, getPathProb(E_V, P)); 
+            B_PN = CreateMul(Builder, TC, getPathProb(E_V, P));
 #endif
 #if defined(PROMOTE_FREQ_select)
             B_PN = selectBranch(Builder, TC, E_V, L->getHeader());
 #endif
          }else{
             BasicBlock* E_Vn = ViewPort[PL].first; // parent loop's view point
-            if(E_Vn == E_V){
-               B_PN = ViewPort[PL].second;// parent loop's view probability
-               B_PN = CreateMul(Builder, B_PN, getPathProb(PL->getHeader(), P)); // B_PN (H-->P)
-               B_PN = Builder.CreateMul(B_PN, TC); // B_PN (H--P) %tc
+            if (E_Vn == E_V) { // if it's view point equal it's parents' we can
+                               // make a simplify
+               B_PN = ViewPort[PL].second; // parent loop's view probability
+               B_PN = CreateMul(Builder, B_PN, getPathProb(PL->getHeader(),
+                                                           P)); // B_PN (H-->P)
+               B_PN = Builder.CreateMul(B_PN, TC); // B_PN (H-->P) %tc
             }else{
                B_PN = one(*BB);
                Loop* IL;
-               for(IL=L,PL=L->getParentLoop(); PL!=NULL&&!PL->contains(E_V);IL=PL,PL=PL->getParentLoop()){
+               for (IL = L, PL = L->getParentLoop();
+                    PL != NULL && !PL->contains(E_V);
+                    IL = PL, PL = PL->getParentLoop()) { // caculate all nest
+                                                         // parent view point
                   B_PN = Builder.CreateMul(B_PN, LTC->getOrInsertTripCount(IL));
-                  B_PN = CreateMul(Builder, B_PN, getPathProb(PL->getHeader(), in_freq(IL)));
+                  B_PN = CreateMul(Builder, B_PN,
+                                   getPathProb(PL->getHeader(), in_freq(IL)));
                }
                B_PN = Builder.CreateMul(B_PN, LTC->getOrInsertTripCount(IL));
                B_PN = CreateMul(Builder, B_PN, getPathProb(E_V, in_freq(IL)));
             }
          }
          ViewPort[L] = std::make_pair(E_V, B_PN);
-         freq = B_PN;
+      }
+   }
+
+   for(auto& BB : F){
+      Loop* L = LI->getLoopFor(&BB);
+      BasicBlock* E_V, *H;
+      Value* B_PN;
+      if(L == NULL){
+         E_V = H = Entry;
+         B_PN = one(BB);
       }else{
          auto View = ViewPort[L];
-         Builder.SetInsertPoint(View.first->getTerminator());
-         freq = CreateMul(Builder, View.second, getPathProb(L->getHeader(), BB));
+         E_V = View.first;
+         B_PN = View.second;
+         H = L->getHeader();
       }
-      SumRhs = force_insert(freq, Builder, BB->getName()+".bfreq");
-      if(ConstantInt* CI = dyn_cast<ConstantInt>(SumRhs)){
-         pred_cls.emplace_back(BB, CI->getSExtValue()); /* DYNAMIC_LOOP_CONST */
-      }else
-         pred_cls.emplace_back(BB, SumRhs); /* DYNAMIC_LOOP_INST */
 
-      PredBlockProfiler::increaseBlockCounter(BB, SumRhs, Builder.GetInsertPoint());
+      Builder.SetInsertPoint(E_V->getTerminator());
+      Value* freq = CreateMul(Builder, B_PN, getPathProb(H, &BB));
+      freq = force_insert(freq, Builder, BB.getName() + ".bfreq");
+
+      PredBlockProfiler::increaseBlockCounter(&BB, freq,
+                                              Builder.GetInsertPoint());
    }
 
    return true;
 }
-
-void PerformPred::print(llvm::raw_ostream & OS, const llvm::Module * M) const
-{
-   static size_t idx = 0;
-   for(auto classify : pred_cls){
-      OS<<"No."<<idx++<<"\t\""<<classify.block->getName()<<"\"\t";
-      switch(classify.type){
-         case STATIC_BLOCK: 
-         case STATIC_LOOP:  
-            OS<<(classify.type==STATIC_BLOCK?"Static Block:\t":"Static Loop Block:\t")<<
-               classify.data.freq<<"\n";
-            break;
-         case DYNAMIC_LOOP_CONST: 
-            OS<<"Dynamic Loop Constant Trip Count:\t"<<
-               classify.data.ext_val<<"\n"; 
-            break;
-         case DYNAMIC_LOOP_INST:  
-            OS<<"Dynamic Loop Instrumented Trip Count\t"<<
-               *classify.data.value<<"\n"; 
-            break;
-      }
-   }
-   OS<<"\n";
-}
-

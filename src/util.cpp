@@ -350,9 +350,10 @@ bool lle::isRefGlobal(Value* V, GlobalVariable** pGV, GetElementPtrInst** pGEP)
 
 bool std::less<BasicBlock>::operator()(BasicBlock* L, BasicBlock* R)
 {
-   using std::placeholders::_1;
+   if(L == NULL || R == NULL) return false;
    if(L->getParent() != R->getParent()) return false;
    Function* F = L->getParent();
+   if(F==NULL) return false;
    unsigned L_idx = std::distance(F->begin(), Function::iterator(L));
    unsigned R_idx = std::distance(F->begin(), Function::iterator(R));
    return L_idx < R_idx;
@@ -360,12 +361,19 @@ bool std::less<BasicBlock>::operator()(BasicBlock* L, BasicBlock* R)
 
 bool std::less<Instruction>::operator()(Instruction* L, Instruction* R)
 {
-   if(L->getParent() != R->getParent())
-      return std::less<BasicBlock>()(L->getParent(), R->getParent());
-   BasicBlock* B = L->getParent();
-   unsigned L_idx = std::distance(B->begin(), BasicBlock::iterator(L));
-   unsigned R_idx = std::distance(B->begin(), BasicBlock::iterator(R));
+   if(L == NULL || R == NULL) return false;
+   BasicBlock* L_B = L->getParent(), *R_B = R->getParent();
+   if(L_B != R_B) return std::less<BasicBlock>()(L_B, R_B);
+   if(L_B == NULL) return false;
+   unsigned L_idx = std::distance(L_B->begin(), BasicBlock::iterator(L));
+   unsigned R_idx = std::distance(R_B->begin(), BasicBlock::iterator(R));
    return L_idx < R_idx;
+}
+
+bool std::less_equal<Instruction>::operator()(Instruction* L, Instruction* R)
+{
+   bool less = std::less<Instruction>()(L, R);
+   return less || L==R;
 }
 
 Constant* lle::insertConstantString(Module* M, const string Inserted) 
@@ -394,19 +402,13 @@ std::vector<BasicBlock*> lle::getPath(BasicBlock *From, BasicBlock *To)
    return Path;
 }
 
-GetElementPtrInst* lle::isRefGEP(Use &O)
-{
-   ConstantExpr* CExpr = dyn_cast<ConstantExpr>(O.get());
-   return dyn_cast<GetElementPtrInst>(CExpr?CExpr->getAsInstruction():O.get());
-}
-
 GetElementPtrInst* lle::isRefGEP(Instruction* I)
 {
    GetElementPtrInst* GEPI = dyn_cast<GetElementPtrInst>(I);
    if(GEPI) return GEPI;
-   for(auto O = I->op_begin(), E = I->op_end(); O!=E; ++O){
-      GetElementPtrInst* GEPI = isRefGEP(*O);
-      if(GEPI) return GEPI;
+   for (auto O = I->op_begin(), E = I->op_end(); O != E; ++O) {
+      GetElementPtrInst* GEPI = isGEP(*O);
+      if (GEPI) return GEPI;
    }
    return NULL;
 }

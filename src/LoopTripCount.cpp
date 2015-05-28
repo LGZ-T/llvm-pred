@@ -8,15 +8,20 @@
 #include <llvm/Analysis/LoopInfo.h>
 #include <llvm/ADT/DepthFirstIterator.h>
 #include <llvm/Transforms/Utils/LoopUtils.h>
-
+#include <llvm/Analysis/ScalarEvolution.h>
+#include <llvm/Analysis/ScalarEvolutionExpressions.h>
 #include <map>
 #include <vector>
 #include <algorithm>
+#include <llvm/IR/Type.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/Analysis/ScalarEvolutionExpander.h>
 
 #include "util.h"
 #include "config.h"
 #include "LoopTripCount.h"
 #include "Resolver.h"
+#include "ddg.h"
 #include "debug.h"
 
 using namespace std;
@@ -51,10 +56,30 @@ static Value* tryFindStart(PHINode* IND,Loop* L,BasicBlock*& StartBB)
 void LoopTripCount::getAnalysisUsage(llvm::AnalysisUsage & AU) const
 {
 	AU.addRequired<LoopInfo>();
+   AU.addRequired<ScalarEvolution>();
 }
 
 LoopTripCount::AnalysisedLoop LoopTripCount::analysis(Loop* L)
 {
+#ifdef TC_USE_SCEV
+   auto& SE = getAnalysis<ScalarEvolution>();
+   const SCEV* LoopInfo = SE.getBackedgeTakenCount(L);
+   Value* TC = NULL;
+   /*BasicBlock* Preheader = L->getLoopPreheader();
+   if(Preheader){
+      string HName = (L->getHeader()->getName()+".tc").str();
+      auto Found = find_if(Preheader->begin(),Preheader->end(), [HName](Instruction& I){
+            return I.getName()==HName;
+            });
+      if(Found != Preheader->end()) TC = &*Found;
+   }*/
+   if(!isa<SCEVCouldNotCompute>(LoopInfo)){
+      AnalysisedLoop ret = {0};
+      ret.userdata = const_cast<void*>((const void*)LoopInfo);
+      ret.TripCount = TC;
+      return ret;
+   }
+#endif
 	Value* start = NULL;
 	Value* ind = NULL;
 	Value* end = NULL;
@@ -77,7 +102,8 @@ LoopTripCount::AnalysisedLoop LoopTripCount::analysis(Loop* L)
 	SmallVector<BasicBlock*,4> Exits;
 	L->getExitingBlocks(Exits);
 
-	if(Exits.size()==1) TE = Exits.front();
+   if(Exits.size()==1) 
+      TE = Exits.front();
 	else{
 		if(std::find(Exits.begin(),Exits.end(),L->getLoopLatch())!=Exits.end()) TE = L->getLoopLatch();
 		else{
@@ -91,7 +117,6 @@ LoopTripCount::AnalysisedLoop LoopTripCount::analysis(Loop* L)
 			if(ExitEdges.size()==1) TE = const_cast<BasicBlock*>(ExitEdges.front().first);
 		}
 	}
-
 	//process true exit
 	AssertThrow(TE, not_found("need have a true exit"));
 
@@ -102,6 +127,7 @@ LoopTripCount::AnalysisedLoop LoopTripCount::analysis(Loop* L)
 		const BranchInst* EBR = cast<BranchInst>(TE->getTerminator());
 		AssertThrow(EBR->isConditional(), not_found("end branch is not conditional"));
 		ICmpInst* EC = dyn_cast<ICmpInst>(EBR->getCondition());
+      AssertThrow(EC, not_found("end condition is not icmp"));
 		if(EC->getPredicate() == EC->ICMP_SGT){
          AssertThrow(!L->contains(EBR->getSuccessor(0)), not_found(dbg()<<"abnormal exit with great than:"<<*EBR));
          //终止块的终止指令---->跳出执行循环外的指令
@@ -139,7 +165,8 @@ LoopTripCount::AnalysisedLoop LoopTripCount::analysis(Loop* L)
 		Value* PSi = IndOrNext->getOperand(0);//point type Step.i
 		int SICount[2] = {0};//store in predecessor count,store in loop body count
 
-      Value* Store = RE.find_store(IndOrNext->getOperandUse(0));
+      Value* Store;
+      RE.resolve(&IndOrNext->getOperandUse(0), RE.findStore(Store));
       if(Store && isa<StoreInst>(Store)){
          StoreInst* SI = cast<StoreInst>(Store);
          if(L->isLoopInvariant(SI->getValueOperand())){
@@ -218,8 +245,62 @@ LoopTripCount::AnalysisedLoop LoopTripCount::analysis(Loop* L)
 	assert(OneStep<=1 && OneStep>=-1);
    return AnalysisedLoop{OneStep, start,step,end,ind};
 }
+Value* ScevToInst(const SCEV *scev_expr,llvm::Instruction *InsertPos){
+   if(auto constant_scev = dyn_cast<SCEVConstant>(scev_expr)){
+      return constant_scev->getValue();
+   }
+   if(auto value_scev = dyn_cast<SCEVUnknown>(scev_expr)){
+      return value_scev->getValue();
+   }
+   IRBuilder<> Builder(InsertPos);
+   Value* inst = NULL;
+   if(auto mul_expr = dyn_cast<SCEVMulExpr>(scev_expr)){
+      auto first_op = mul_expr->op_begin();
+      Value* LHS = ScevToInst(*first_op,InsertPos);
+      if(LHS == NULL)
+         return NULL;
+      for(auto O = mul_expr->op_begin()+1, E = mul_expr->op_end(); O != E; ++O){
+         Value* RHS = ScevToInst(*O,InsertPos);
+         if(RHS == NULL)
+            return NULL;
+         inst = Builder.CreateMul(LHS,RHS);
+      }
+   }else if(auto add_expr = dyn_cast<SCEVAddExpr>(scev_expr)){
+      auto first_op = add_expr->op_begin();
+      Value* LHS_add = ScevToInst(*first_op,InsertPos);
+      if(LHS_add == NULL)
+         return NULL;
+      for(auto O_add = add_expr->op_begin()+1, E_add = add_expr->op_end(); O_add != E_add; ++O_add){
+         Value* RHS_add = ScevToInst(*O_add,InsertPos);
+         if(RHS_add == NULL)
+            return NULL;
+         inst = Builder.CreateAdd(LHS_add,RHS_add);
+      }
+   }else if(auto cast_expr = dyn_cast<SCEVCastExpr>(scev_expr)){
+      return ScevToInst(cast_expr->getOperand(), InsertPos);
+   }
+  return inst;
+}
+
 Value* LoopTripCount::insertTripCount(AnalysisedLoop AL, StringRef HeaderName, Instruction* InsertPos)
 {
+#ifdef TC_USE_SCEV
+   SCEV* scev_expr = (SCEV*)AL.userdata;
+   if(scev_expr && !isa<SCEVCouldNotCompute>(scev_expr)){
+      ScalarEvolution& SE = getAnalysis<ScalarEvolution>();
+      SCEVExpander Expander(SE,"loop-trip-count");
+      Value *inst = Expander.expandCodeFor(scev_expr,scev_expr->getType(),InsertPos);
+      IRBuilder<> B(InsertPos);
+      Type* I32Ty = B.getInt32Ty();
+      if(inst->getType() != I32Ty){
+         inst = B.CreateCast(CastInst::getCastOpcode(inst, false, I32Ty, false), inst, I32Ty);
+      }
+      if(inst != NULL){
+         inst->setName(HeaderName+".tc");
+      }
+      return inst;
+   }
+#endif
 	Value* RES = NULL;
    Value* start = AL.Start, *END = AL.End;
    if(!start || !END || !InsertPos || !AL.Step) return NULL;

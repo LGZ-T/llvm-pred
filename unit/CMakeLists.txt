@@ -12,15 +12,16 @@ add_definitions(-fno-rtti)
 add_definitions(-Wall --std=c++11)
 
 add_executable(unit_test
+   IgnoreListTest.cpp
    GEPFilterTest.cpp
    CGFilterTest.cpp
    NousedTest.cpp
    UtilTest.cpp
+   gtest/gtest-all.cc
+   gtest/gtest_main.cc
    )
 target_link_libraries(unit_test
 	${LLVM_DYNAMIC_LIBRARY}
    LLVMPred
-   gtest
-   gmock
-   gmock_main
+   pthread
 	)
