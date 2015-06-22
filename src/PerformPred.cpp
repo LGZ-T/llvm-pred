@@ -18,8 +18,13 @@ namespace lle {
 
 class lle::PerformPred : public llvm::FunctionPass
 {
+   struct ViewPortElem{
+      llvm::BasicBlock* first;
+      llvm::Value* second;
+      llvm::Value* third;
+   };
    llvm::DenseMap<llvm::Instruction*, llvm::Value*> Promoted;
-   llvm::DenseMap<llvm::Loop*, std::pair<llvm::BasicBlock*, llvm::Value*> > ViewPort; // Header -> (E_P, B_P,N)
+   llvm::DenseMap<llvm::Loop*, ViewPortElem> ViewPort; // Header -> (E_P, B_P,N, TC)
    llvm::BranchProbabilityInfo* BPI;
    llvm::BlockFrequencyInfo* BFI;
    llvm::LoopInfo* LI;
@@ -175,12 +180,27 @@ BasicBlock* PerformPred::findCriticalBlock(BasicBlock *From, BasicBlock *To)
    return Last;
 }
 
+/** promote loop trip count instruction
+ * @case 1:
+ *    LoopTC is Constant, L has ParentLoop
+ * @result : we should consider PL's ViewPort
+ *
+ * @case 2:
+ *    LoopTC is Instruction, L hasn't ParentLoop
+ *    LoopTC's depends is not Instruction
+ * @example:
+ *    %4 = sub i32 %argc, 1
+ *    %.lr.ph47.tc = sub i32 %4, 1
+ *    %argc is Argument
+ * @result
+ *    we shouldn't consider depends, directly promote to Entry Block
+ */
 BasicBlock* PerformPred::promote(Instruction* LoopTC, Loop* L)
 {
    SmallVector<BasicBlock*, 4> depends;
    SmallVector<Instruction*, 4> targets;
 
-   if(LoopTC) targets.push_back(LoopTC);
+   if(LoopTC) targets.push_back(LoopTC); // should also consider PL
    unsigned Idx = 0;
    while(Idx != targets.size()){
       Instruction* I = targets[Idx];
@@ -197,15 +217,14 @@ BasicBlock* PerformPred::promote(Instruction* LoopTC, Loop* L)
    }
    Loop* PL = L->getParentLoop();
    if(PL) depends.push_back(ViewPort[PL].first);
-   
 
    BasicBlock* InsertInto, *dep;
    if(depends.empty())
-      return &L->getHeader()->getParent()->getEntryBlock();
-
-   InsertInto = depends.front();
+      InsertInto = &L->getHeader()->getParent()->getEntryBlock();
+   else
+      InsertInto = depends.front();
    if(depends.size()>1){
-      /* let C is insert point, 
+      /* let C is insert point,
        * dep1 dom C, dep2 dom C => dep1 dom dep2 or dep2 dom dep1 */
       for(auto Ite = depends.begin()+1, E = depends.end(); Ite != E; ++Ite){
          dep = *Ite;
@@ -286,7 +305,12 @@ bool PerformPred::runOnFunction(Function &F)
          Value* B_PN = NULL;
          // if we can find trip count, we promote view point, or we just select
          // entry as view point
-         BasicBlock* E_V = TC ? promote(dyn_cast<Instruction>(TC), L) : Entry;
+#ifdef USE_PROMOTE
+         BasicBlock* E_V = TC ? promote(dyn_cast<Instruction>(TC), L)
+                              : (PL ? ViewPort[PL].first : Entry);
+#else
+         BasicBlock* E_V = L->getLoopPreheader();
+#endif
          Builder.SetInsertPoint(E_V->getTerminator());
          if (TC == NULL) {
             // freq(H) / in_freq would get trip count as llvm's freq
@@ -310,19 +334,20 @@ bool PerformPred::runOnFunction(Function &F)
             }else{
                B_PN = one(*BB);
                Loop* IL;
+               ViewPort[L].third = TC;
                for (IL = L, PL = L->getParentLoop();
                     PL != NULL && !PL->contains(E_V);
                     IL = PL, PL = PL->getParentLoop()) { // caculate all nest
                                                          // parent view point
-                  B_PN = Builder.CreateMul(B_PN, LTC->getOrInsertTripCount(IL));
+                  B_PN = Builder.CreateMul(B_PN, ViewPort[IL].third);
                   B_PN = CreateMul(Builder, B_PN,
                                    getPathProb(PL->getHeader(), in_freq(IL)));
                }
-               B_PN = Builder.CreateMul(B_PN, LTC->getOrInsertTripCount(IL));
+               B_PN = Builder.CreateMul(B_PN, ViewPort[IL].third);
                B_PN = CreateMul(Builder, B_PN, getPathProb(E_V, in_freq(IL)));
             }
          }
-         ViewPort[L] = std::make_pair(E_V, B_PN);
+         ViewPort[L] = ViewPortElem{E_V, B_PN, TC};
       }
    }
 

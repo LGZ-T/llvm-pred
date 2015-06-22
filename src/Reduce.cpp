@@ -10,6 +10,7 @@
 #include <llvm/Transforms/Utils/BasicBlockUtils.h>
 #include <llvm/IR/IntrinsicInst.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/Analysis/CallGraph.h>
 
 #include <ValueProfiling.h>
 
@@ -20,7 +21,7 @@
 #include "ddg.h"
 #include "debug.h"
 
-static unsigned DT[30] = {0};
+static unsigned DT[128] = {0};
 static int dt_init() {
 #include "datatype.h"
    return 0;
@@ -28,12 +29,16 @@ static int dt_init() {
 static int _DT_INIT = dt_init();
 
 // a deeper notice removed object
+#define WHAT_RMD(what) {}
+#if 0
 #define WHAT_RMD(what)                                                         \
    DEBUG({                                                                     \
       errs() << *(what).getUser() << " removed in line ";                      \
       errs() << __LINE__ << ":\n";                                             \
       errs() << " -->" << *(what).get() << "\n";                               \
    })
+#endif
+#define REAL_RMD(what) DEBUG({ errs() << *(what) << " real removed \n"; })
 #ifdef ANNOY_DEBUG
 #define WHY_KEPT(what, searched)                                               \
    DEBUG({                                                                     \
@@ -61,9 +66,9 @@ using namespace std;
 using namespace lle;
 using namespace llvm;
 
-static const std::set<StringRef> MpiDelayDelete = {
-  "mpi_init_", "mpi_finalize_", "mpi_comm_rank_", "mpi_comm_size_"
-};
+static const std::set<StringRef> MpiDelayDelete
+    = { "mpi_init_", "mpi_finalize_", "mpi_comm_rank_", "mpi_comm_size_",
+        "mpi_barrier_" };
 
 char ReduceCode::ID = 0;
 static RegisterPass<ReduceCode> Y("Reduce", "Slash and Shrink Code to make a minicore program");
@@ -94,26 +99,33 @@ struct excluded{
 // a simple basic noused check 
 static AttributeFlags noused_flat(llvm::Use& U, ResolveEngine::CallBack C = ResolveEngine::always_false)
 {
-   ResolveEngine RE;
-   RE.addRule(RE.ibase_rule);
-   InitRule ir(RE.iuse_rule);
-   RE.addRule(std::ref(ir));
-   RE.addFilter(C);
-   RE.addFilter(iUseFilter(&U));
+   static bool inited = false;
+   static ResolveEngine RE;
+   static InitRule ir(RE.iuse_rule);
+   static ResolveCache RC1, RC2, RC3;
+   if(!inited){
+     RE.addRule(RE.ibase_rule);
+     RE.addRule(std::ref(ir));
+     inited = true;
+   }
+
    Use* ToSearch = &U;
    Value* Searched;
+   RE.clearFilters();
+   RE.addFilter(C);
+   RE.addFilter(iUseFilter(&U));
    RE.addFilter(RE.exclude(&U));
+   RE.useCache(RC1);
+   ir.clear();
    RE.resolve(ToSearch, RE.findVisit(Searched));
    if(Searched){
       WHY_KEPT(U, Searched);
       return AttributeFlags::None;
    }
-   if(auto GEP = isGEP(U)){
-      // if we didn't find direct visit on Pointed, we tring find visit on
-      // GEP->getPointerOperand()
-      RE.addFilter(GEPFilter(GEP));
-      ToSearch = &GEP->getOperandUse(0);
+   if(auto CAST = isCast_(U)){
+      ToSearch = &CAST->getOperandUse(0);
       ir.clear();
+      RE.useCache(RC3);
       RE.resolve(ToSearch, RE.findVisit(Searched));
       if (Searched) {
          WHY_KEPT(U, Searched);
@@ -123,10 +135,18 @@ static AttributeFlags noused_flat(llvm::Use& U, ResolveEngine::CallBack C = Reso
          Dbg_PrintGraph(RE.resolve(ToSearch), U.getUser());
       }
    }
-   if(auto CAST = isCast(U)){
-      ToSearch = &CAST->getOperandUse(0);
-      ir.clear();
-      RE.resolve(ToSearch, RE.findVisit(Searched));
+   if(auto GEP = isGEP(U)){
+      // if we didn't find direct visit on Pointed, we tring find visit on
+      // GEP->getPointerOperand()
+      unsigned notused;
+      if(!RC2.ask(&U, Searched, notused)){
+         RE.addFilter(GEPFilter(GEP));
+         ToSearch = &GEP->getOperandUse(0);
+         ir.clear();
+         RE.resolve(ToSearch, RE.findVisit(Searched));
+         RC2.storeKey(&U);
+         RC2.storeValue(Searched, 0);
+      }
       if (Searched) {
          WHY_KEPT(U, Searched);
          return AttributeFlags::None;
@@ -144,8 +164,9 @@ static AttributeFlags noused_flat(llvm::Use& U, ResolveEngine::CallBack C = Reso
 AttributeFlags ReduceCode::getAttribute(CallInst * CI)
 {
    StringRef Name = castoff(CI->getCalledValue())->getName();
+   string NameRef;
    if(auto I = dyn_cast<IntrinsicInst>(CI))
-      Name = getName(I->getIntrinsicID());
+      Name = NameRef = getName(I->getIntrinsicID()); // nameref hold a real string
    auto Found = Attributes.find(Name);
    if(Found == Attributes.end()) return AttributeFlags::None;
    auto Ret = Found->second(CI);
@@ -168,9 +189,9 @@ AttributeFlags ReduceCode::noused_param(Argument* Arg)
          Argument* NestArg = dyn_cast<Argument>(Para->get());
          if(f && NestArg) f &= Self->noused_param(NestArg);
          GlobalVariable* GV = NULL;
-         GetElementPtrInst* GEP = NULL;
+         Use* GEP = NULL;
          if(f && isRefGlobal(Para->get(), &GV, &GEP))
-            f &= FLAG(Self->noused_global(GV, CI, excluded(S)));
+            f &= FLAG(Self->noused_global(GV, CI, GEP, excluded(S)));
          return f;
          });
    return all_deletable ? IsDeletable : AttributeFlags::None;
@@ -200,17 +221,34 @@ static AttributeFlags noused_ret_rep(ReturnInst* RI)
       ReturnInst::Create(F->getContext(), UndefValue::get(Ret->getType()), RI->getParent());
    return all_deletable ? IsDeletable : AttributeFlags::None;
 }
-Value* ReduceCode::noused_global(GlobalVariable* GV, Instruction* GEP, ResolveEngine::CallBack C)
+Value* ReduceCode::noused_global(GlobalVariable* GV, Instruction* pos, Use* GEP, ResolveEngine::CallBack C)
 {
-   ResolveEngine RE;
-   RE.addRule(RE.ibase_rule);
-   CGF->update(GEP);
+   static ResolveEngine RE;
+   static bool inited = false;
+   static ResolveCache RC;
+   if(!inited){
+      RE.addRule(RE.ibase_rule);
+      inited = true;
+   }
+   RE.clearFilters();
+   CGF->update(pos);
    RE.addFilter(*CGF);
-   GetElementPtrInst* GEPI = isRefGEP(GEP);
-   if(GEPI) RE.addFilter(GEPFilter(GEPI));
-   RE.addFilter(C);
    Value* Visit;
+   unsigned op;
+   if(GEP){
+      RE.addFilter(GEPFilter(dyn_cast<User>(GEP->get())));
+      // we need the real address GEP(Inst or ConstantExpr) to lookup, 
+      // so it shouldn't use ConstantExpr::getAsInstruction's return
+      // because this address is not stable
+      if(RC.ask(GEP, Visit, op))
+         return Visit;
+   }
+   RE.addFilter(C);
    RE.resolve(GV, RE.findVisit(Visit));
+   if(GEP && Visit){
+      RC.storeKey(GEP);
+      RC.storeValue(Visit, 0);
+   }
    Dbg_PrintGraph(RE.resolve(GV), nullptr);
    return Visit;
 }
@@ -224,12 +262,12 @@ AttributeFlags ReduceCode::nousedOperator(Use& op, Instruction* pos, ConfigFlags
    auto GEP = isGEP(op);
 
    if(GEP){
-      Arg = dyn_cast<Argument>(GEP->getPointerOperand());
-      Alloca = dyn_cast<AllocaInst>(GEP->getPointerOperand());
+      Arg = dyn_cast<Argument>(GEP->getOperand(0));
+      Alloca = dyn_cast<AllocaInst>(GEP->getOperand(0));
       // 过于激进的删除
-      if(GlobalVariable* GV = dyn_cast<GlobalVariable>(GEP->getPointerOperand())){
+      if(GlobalVariable* GV = dyn_cast<GlobalVariable>(GEP->getOperand(0))){
          if(GV->getName().endswith("Counters")) return AttributeFlags::None;
-         what = noused_global(GV, pos);
+         what = noused_global(GV, pos, GEP?&op:NULL);
          NOTICE(op, what);
          return FLAG(what);
       }
@@ -302,6 +340,7 @@ bool ReduceCode::runOnFunction(Function& F)
 #endif
          }
          if(flag & IsDeletable){
+            REAL_RMD(Inst);
             (flag & Cascade)? dse.DeleteCascadeInstruction(Inst): 
                dse.DeleteDeadInstruction(Inst);
             Ret = MadeChange = true;
@@ -510,12 +549,14 @@ static AttributeFlags mpi_delay_delete(CallInst* CI, MPIStatistics* stat)
   if(stat->count() > 0) return AttributeFlags::None;
   else return AttributeFlags::IsDeletable;
 }
-static AttributeFlags mpi_allreduce_force(CallInst* CI)
+template <unsigned send = 0, unsigned recv = 1, unsigned count = 2,
+          unsigned type = 3>
+static AttributeFlags replace_with_memcpy(CallInst* CI)
 {
-   Value* Send  = CI->getArgOperand(0);
-   Value* Recv  = CI->getArgOperand(1);
-   Value* Count = CI->getArgOperand(2);
-   Value* Type  = CI->getArgOperand(3);
+   Value* Send  = CI->getArgOperand(send);
+   Value* Recv  = CI->getArgOperand(recv);
+   Value* Count = CI->getArgOperand(count);
+   Value* Type  = CI->getArgOperand(type);
    auto GV = dyn_cast<GlobalVariable>(Type);
    auto GVI = dyn_cast_or_null<ConstantInt>(GV?GV->getInitializer():NULL);
    uint64_t TyIdx = GVI?GVI->getZExtValue():7; // DT[7] == 4, default is int
@@ -525,57 +566,6 @@ static AttributeFlags mpi_allreduce_force(CallInst* CI)
    Builder.CreateMemCpy(Recv, Send, Builder.CreateLoad(Count), TySize);
    return AttributeFlags::IsDeletable;
 }
-# if 0
-static AttributeFlags mpi_allreduce_force(CallInst* CI)
-{
-   //FIXME should replaced with memcpy
-   Value* Send = CI->getArgOperand(0);
-   Value* Recv = CI->getArgOperand(1);
-   if(std::less<Instruction>()(dyn_cast<Instruction>(Recv), dyn_cast<Instruction>(Send)));
-      std::swap(Send, Recv);
-
-   // if there are free of Send and free of Recv, we replace Recv Use with
-   // send, then we free Send twice. this is bad, 
-   // we can remove Send's Use for now
-   ResolveEngine RE;
-   RE.addRule(RE.ibase_rule);
-   InitRule ir(RE.iuse_rule);
-   RE.addRule(std::ref(ir));
-   Use* Q = &CI->getArgOperandUse(0);
-   iUseFilter uf(Q);
-   RE.addFilter(std::ref(uf));
-   RE.resolve(Q, [](Use* U){
-         CallInst* Call = dyn_cast<CallInst>(U->getUser());
-         Function* F = NULL;
-         if(Call && (F = Call->getCalledFunction())){
-            if(F->getName()=="free"){
-               Call->setArgOperand(0, UndefValue::get(Call->getArgOperand(0)->getType()));
-               Call->removeFromParent();
-            }
-         }
-         return false;
-      });
-   ir.clear();
-   Q = &CI->getArgOperandUse(1);
-   uf.update(Q);
-   auto ddg = RE.resolve(Q, [](Use* U){
-         errs()<<*U->getUser()<<"\n";
-         CallInst* Call = dyn_cast<CallInst>(U->getUser());
-         Function* F = NULL;
-         if(Call && (F = Call->getCalledFunction())){
-            if(F->getName()=="llvm.lifetime.end"){
-               Call->setArgOperand(1, UndefValue::get(Call->getArgOperand(1)->getType()));
-               Call->removeFromParent();
-            }
-         }
-         return false;
-      });
-   WriteGraph(&ddg, "test");
-
-   Recv->replaceAllUsesWith(Send);
-   return AttributeFlags::IsDeletable;
-}
-#endif
 
 ReduceCode::ReduceCode()
     : ModulePass(ID)
@@ -614,35 +604,43 @@ ReduceCode::ReduceCode()
 //int MPI_Reduce(const void *sendbuf, void *recvbuf, int count, MPI_Datatype datatype,
 //               MPI_Op op, int root, MPI_Comm comm)
 //Deletable if recvbuf is no used
-      Attributes["mpi_reduce_"] = mpi_allreduce_force;
+      Attributes["mpi_reduce_"] = replace_with_memcpy<0,1,2,3>;
 //int MPI_Allreduce(const void *sendbuf, void *recvbuf, int count,
 //                  MPI_Datatype datatype, MPI_Op op, MPI_Comm comm)
-      Attributes["mpi_allreduce_"] = mpi_allreduce_force;
+      Attributes["mpi_allreduce_"] = replace_with_memcpy<0,1,2,3>;
 //int MPI_Bcast( void *buffer, int count, MPI_Datatype datatype, int root, 
 //               MPI_Comm comm )
       Attributes["mpi_bcast_"] = DirectDelete;
-   }else{
-      Attributes["mpi_reduce_"] = mpi_nouse_recvbuf;
-      Attributes["mpi_allreduce_"] = mpi_nouse_recvbuf;
-      Attributes["mpi_bcast_"] = mpi_nouse_buf;
-   }
-//int MPI_Alltoall(const void *sendbuf, int sendcount, MPI_Datatype sendtype,
-//                 void *recvbuf, int recvcount, MPI_Datatype recvtype,
-//                 MPI_Comm comm)
-   Attributes["mpi_alltoall_"] = std::bind(nouse_at, _1, 3);
+//int MPI_Irecv(void *buf, int count, MPI_Datatype datatype, int source,
+//              int tag, MPI_Comm comm, MPI_Request *request)
+//int MPI_Isend(const void *buf, int count, MPI_Datatype datatype, int dest, int tag,
+//              MPI_Comm comm, MPI_Request *request)
+      Attributes["mpi_isend_"] = DirectDelete;
+      Attributes["mpi_irecv_"] = DirectDelete;
 //Deletable if recvbuf is no used
 //int MPI_Send(const void *buf, int count, MPI_Datatype datatype, int dest, int tag,
 //             MPI_Comm comm)
 //int MPI_Recv(void *buf, int count, MPI_Datatype datatype, int source, int tag,
 //             MPI_Comm comm, MPI_Status *status)
-   Attributes["mpi_send_"] = mpi_nouse_buf;
-   Attributes["mpi_recv_"] = mpi_nouse_buf;
-//int MPI_Irecv(void *buf, int count, MPI_Datatype datatype, int source,
-//              int tag, MPI_Comm comm, MPI_Request *request)
-//int MPI_Isend(const void *buf, int count, MPI_Datatype datatype, int dest, int tag,
-//              MPI_Comm comm, MPI_Request *request)
-   Attributes["mpi_isend_"] = mpi_nouse_buf;
-   Attributes["mpi_irecv_"] = mpi_nouse_buf;
+      Attributes["mpi_send_"] = DirectDelete;
+      Attributes["mpi_recv_"] = DirectDelete;
+      Attributes["mpi_comm_dup_"] = DirectDelete;//bt
+      // since alltoall need communite all threads, but we don't know the
+      // content, so we could only copy send to recv
+      Attributes["mpi_alltoall_"] = replace_with_memcpy<0,3,4,5>; //ft
+   }else{
+      Attributes["mpi_reduce_"] = mpi_nouse_recvbuf;
+      Attributes["mpi_allreduce_"] = mpi_nouse_recvbuf;
+      Attributes["mpi_bcast_"] = mpi_nouse_buf;
+      Attributes["mpi_isend_"] = mpi_nouse_buf;
+      Attributes["mpi_irecv_"] = mpi_nouse_buf;
+      Attributes["mpi_send_"] = mpi_nouse_buf;
+      Attributes["mpi_recv_"] = mpi_nouse_buf;
+      Attributes["mpi_alltoall_"] = std::bind(nouse_at, _1, 3);
+   }
+//int MPI_Alltoall(const void *sendbuf, int sendcount, MPI_Datatype sendtype,
+//                 void *recvbuf, int recvcount, MPI_Datatype recvtype,
+//                 MPI_Comm comm)
    Attributes["mpi_comm_split_"] = DirectDelete;
    Attributes["mpi_comm_rank_"] = std::bind(mpi_comm_replace, _1, &Protected, stat, "MPI_RANK");
    Attributes["mpi_comm_size_"] = std::bind(mpi_comm_replace, _1, &Protected, stat, "MPI_SIZE");
