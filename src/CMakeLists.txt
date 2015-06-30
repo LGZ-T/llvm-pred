@@ -25,8 +25,9 @@ add_library(LLVMPred SHARED
    DSEAdaptive.cpp
    DAEAdaptive.cpp
    PerformPred.cpp
-   Adaptive.cpp
+   InsertTime.cpp
    Resolver.cpp
+   Adaptive.cpp
    Reduce.cpp
    Print.cpp
    util.cpp
